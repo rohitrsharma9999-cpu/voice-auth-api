@@ -3,7 +3,6 @@ import io
 import os
 import joblib
 import numpy as np
-import pandas as pd
 import librosa
 import scipy.stats as stats
 from fastapi import FastAPI, Header, HTTPException
@@ -147,3 +146,4 @@ def detect_voice(request: VoiceRequest, x_api_key: str = Header(...)):
         "classification": classification,
         "confidenceScore": round(confidence, 2)
     }
+
