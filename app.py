@@ -12,31 +12,24 @@ from pydantic import BaseModel
 # CONFIGURATION
 # ==============================
 
-API_KEY = os.environ.get("API_KEY")
+API_KEY = os.environ.get("API_KEY")  # MUST set on Render
 
 SUPPORTED_LANGUAGES = ["Tamil", "English", "Hindi", "Malayalam", "Telugu"]
 
 # ==============================
-# LOAD TRAINED MODEL
+# LOAD TRAINED MODEL ARTIFACTS
 # ==============================
 
 model = joblib.load("voice_auth_model.pkl")
 scaler = joblib.load("voice_auth_scaler.pkl")
 feature_columns = joblib.load("feature_columns.pkl")
+feature_stats = joblib.load("feature_stats.pkl")
 
 # ==============================
 # FASTAPI INIT
 # ==============================
 
 app = FastAPI(title="AI Voice Authenticity API")
-
-# ==============================
-# HEALTH CHECK
-# ==============================
-
-@app.get("/")
-def health_check():
-    return {"status": "API is running"}
 
 # ==============================
 # REQUEST SCHEMA
@@ -79,7 +72,7 @@ def extract_features_from_bytes(audio_bytes):
     temporal_smoothness = np.var(np.diff(y))
 
     return {
-        "duration": float(len(y)/sr),
+        "duration": len(y)/sr,
         "mean_energy": float(np.mean(energy)),
         "energy_variance": float(np.var(energy)),
         "zcr_mean": float(np.mean(zcr)),
@@ -97,41 +90,61 @@ def extract_features_from_bytes(audio_bytes):
     }
 
 # ==============================
+# STATISTICALLY ANCHORED EXPLANATION
+# ==============================
+
+def generate_statistical_explanation(features, classification):
+
+    deviations = []
+
+    for feature in feature_columns:
+        mean = feature_stats[feature]["mean"]
+        std = feature_stats[feature]["std"]
+
+        if std == 0:
+            continue
+
+        z_score = (features[feature] - mean) / std
+
+        if abs(z_score) > 1.5:
+            direction = "high" if z_score > 0 else "low"
+            deviations.append(f"{direction} {feature.replace('_', ' ')}")
+
+    if not deviations:
+        return "Signal characteristics fall within learned distribution ranges."
+
+    top_features = ", ".join(deviations[:3])
+
+    if classification == "AI_GENERATED":
+        return f"Statistical deviation detected with {top_features}, consistent with synthetic signal behavior."
+    else:
+        return f"Natural variability observed with {top_features}, consistent with human acoustic patterns."
+
+# ==============================
 # MAIN ENDPOINT
 # ==============================
 
 @app.post("/api/voice-detection")
 def detect_voice(request: VoiceRequest, x_api_key: str = Header(...)):
 
-    # API Key Validation
-    if API_KEY is None:
-        raise HTTPException(status_code=500, detail="Server API key not configured")
-
     if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API Key")
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
-    # Language Validation
     if request.language not in SUPPORTED_LANGUAGES:
         raise HTTPException(status_code=400, detail="Unsupported language")
 
-    # Audio Format Validation
     if request.audioFormat.lower() != "mp3":
-        raise HTTPException(status_code=400, detail="Only MP3 format supported")
+        raise HTTPException(status_code=400, detail="Only mp3 format supported")
 
-    # Base64 Decode
     try:
         audio_bytes = base64.b64decode(request.audioBase64)
-    except Exception:
+    except:
         raise HTTPException(status_code=400, detail="Invalid Base64 audio")
 
-    # Feature Extraction
     features = extract_features_from_bytes(audio_bytes)
 
-    # Convert to DataFrame and ensure correct feature order
-    sample_df = pd.DataFrame([features])
-    sample_df = sample_df[feature_columns]
-
-    sample_scaled = scaler.transform(sample_df)
+    sample_vector = np.array([features[col] for col in feature_columns]).reshape(1, -1)
+    sample_scaled = scaler.transform(sample_vector)
 
     probabilities = model.predict_proba(sample_scaled)[0]
     prediction = model.predict(sample_scaled)[0]
@@ -140,10 +153,14 @@ def detect_voice(request: VoiceRequest, x_api_key: str = Header(...)):
     human_probability = float(probabilities[0])
 
     classification = "AI_GENERATED" if prediction == 1 else "HUMAN"
-    confidence = float(max(ai_probability, human_probability))
+    confidence = round(float(max(ai_probability, human_probability)), 2)
+
+    explanation = generate_statistical_explanation(features, classification)
 
     return {
+        "status": "success",
+        "language": request.language,
         "classification": classification,
-        "confidenceScore": round(confidence, 2)
+        "confidenceScore": confidence,
+        "explanation": explanation
     }
-
