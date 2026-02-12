@@ -7,6 +7,8 @@ import librosa
 import scipy.stats as stats
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
+import tempfile
+import os
 
 # ==============================
 # CONFIGURATION
@@ -56,7 +58,20 @@ class VoiceRequest(BaseModel):
 # ==============================
 
 def extract_features_from_bytes(audio_bytes):
-    y, sr = librosa.load(io.BytesIO(audio_bytes), sr=None)
+    try:
+        # Save to temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+            tmp.write(audio_bytes)
+            temp_path = tmp.name
+
+        # Load using librosa from file path
+        y, sr = librosa.load(temp_path, sr=None)
+
+        # Remove temp file
+        os.remove(temp_path)
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Audio processing failed: {str(e)}")
 
     frame_length = 2048
     hop_length = 512
