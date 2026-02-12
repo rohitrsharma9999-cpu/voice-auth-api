@@ -1,77 +1,54 @@
 import base64
-import io
 import os
+import tempfile
 import joblib
 import numpy as np
 import librosa
 import scipy.stats as stats
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
-import tempfile
-import os
 
-# ==============================
+# =====================================================
 # CONFIGURATION
-# ==============================
+# =====================================================
 
-API_KEY = os.environ.get("API_KEY")  # MUST set on Render
+API_KEY = os.environ.get("API_KEY")
 
 SUPPORTED_LANGUAGES = ["Tamil", "English", "Hindi", "Malayalam", "Telugu"]
 
-# ==============================
-# LOAD TRAINED MODEL ARTIFACTS
-# ==============================
+# =====================================================
+# LOAD TRAINED ARTIFACTS (DSP BACKEND BRAIN)
+# =====================================================
 
 model = joblib.load("voice_auth_model.pkl")
 scaler = joblib.load("voice_auth_scaler.pkl")
 feature_columns = joblib.load("feature_columns.pkl")
-feature_stats = joblib.load("feature_stats.pkl")
+feature_stats = joblib.load("feature_stats.pkl")  # contains dataset_means & dataset_stds
 
-# ==============================
+dataset_means = feature_stats["means"]
+dataset_stds = feature_stats["stds"]
+
+# =====================================================
 # FASTAPI INIT
-# ==============================
+# =====================================================
 
 app = FastAPI(title="AI Voice Authenticity API")
 
-# ==============================
-# HEALTH CHECK ROUTE
-# ==============================
-
-@app.get("/")
-def health_check():
-    return {
-        "status": "success",
-        "message": "AI Voice Authenticity API is running"
-    }
-
-# ==============================
+# =====================================================
 # REQUEST SCHEMA
-# ==============================
+# =====================================================
 
 class VoiceRequest(BaseModel):
     language: str
     audioFormat: str
     audioBase64: str
 
-# ==============================
-# DSP FEATURE EXTRACTION
-# ==============================
+# =====================================================
+# DSP FEATURE EXTRACTION (CONNECTED TO COLAB ENGINE)
+# =====================================================
 
-def extract_features_from_bytes(audio_bytes):
-    try:
-        # Save to temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-            tmp.write(audio_bytes)
-            temp_path = tmp.name
-
-        # Load using librosa from file path
-        y, sr = librosa.load(temp_path, sr=None)
-
-        # Remove temp file
-        os.remove(temp_path)
-
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Audio processing failed: {str(e)}")
+def extract_features_from_file(file_path):
+    y, sr = librosa.load(file_path, sr=None)
 
     frame_length = 2048
     hop_length = 512
@@ -115,60 +92,78 @@ def extract_features_from_bytes(audio_bytes):
         "temporal_smoothness_index": float(temporal_smoothness)
     }
 
-# ==============================
-# STATISTICALLY ANCHORED EXPLANATION
-# ==============================
+# =====================================================
+# STATISTICALLY ANCHORED EXPLANATION ENGINE
+# =====================================================
 
-def generate_statistical_explanation(features, classification):
-
-    deviations = []
+def generate_explanation(features, classification):
+    deviations = {}
 
     for feature in feature_columns:
-        mean = feature_stats[feature]["mean"]
-        std = feature_stats[feature]["std"]
+        mean = dataset_means[feature]
+        std = dataset_stds[feature] + 1e-6
+        z_score = abs((features[feature] - mean) / std)
+        deviations[feature] = z_score
 
-        if std == 0:
-            continue
-
-        z_score = (features[feature] - mean) / std
-
-        if abs(z_score) > 1.5:
-            direction = "high" if z_score > 0 else "low"
-            deviations.append(f"{direction} {feature.replace('_', ' ')}")
-
-    if not deviations:
-        return "Signal characteristics fall within learned distribution ranges."
-
-    top_features = ", ".join(deviations[:3])
+    top_features = sorted(deviations, key=deviations.get, reverse=True)[:3]
 
     if classification == "AI_GENERATED":
-        return f"Statistical deviation detected with {top_features}, consistent with synthetic signal behavior."
+        return f"AI classification influenced by high statistical deviation in {', '.join(top_features)}."
     else:
-        return f"Natural variability observed with {top_features}, consistent with human acoustic patterns."
+        return f"Human classification supported by natural variance in {', '.join(top_features)}."
 
-# ==============================
+# =====================================================
+# HEALTH CHECK
+# =====================================================
+
+@app.get("/")
+def health_check():
+    return {
+        "status": "success",
+        "message": "AI Voice Authenticity API is running"
+    }
+
+# =====================================================
 # MAIN ENDPOINT
-# ==============================
+# =====================================================
 
 @app.post("/api/voice-detection")
 def detect_voice(request: VoiceRequest, x_api_key: str = Header(...)):
 
+    # API Key Validation
     if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+        raise HTTPException(status_code=401, detail="Invalid API Key")
 
+    # Language Validation
     if request.language not in SUPPORTED_LANGUAGES:
         raise HTTPException(status_code=400, detail="Unsupported language")
 
+    # Format Validation
     if request.audioFormat.lower() != "mp3":
-        raise HTTPException(status_code=400, detail="Only mp3 format supported")
+        raise HTTPException(status_code=400, detail="Only MP3 format supported")
 
+    # Base64 Decode
     try:
         audio_bytes = base64.b64decode(request.audioBase64)
-    except:
+    except Exception:
         raise HTTPException(status_code=400, detail="Invalid Base64 audio")
 
-    features = extract_features_from_bytes(audio_bytes)
+    # Save to temporary file (production-safe MP3 handling)
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+            tmp.write(audio_bytes)
+            temp_path = tmp.name
 
+        features = extract_features_from_file(temp_path)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Audio processing failed: {str(e)}")
+
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+    # Feature vector
     sample_vector = np.array([features[col] for col in feature_columns]).reshape(1, -1)
     sample_scaled = scaler.transform(sample_vector)
 
@@ -179,14 +174,14 @@ def detect_voice(request: VoiceRequest, x_api_key: str = Header(...)):
     human_probability = float(probabilities[0])
 
     classification = "AI_GENERATED" if prediction == 1 else "HUMAN"
-    confidence = round(float(max(ai_probability, human_probability)), 2)
+    confidence = float(max(ai_probability, human_probability))
 
-    explanation = generate_statistical_explanation(features, classification)
+    explanation = generate_explanation(features, classification)
 
     return {
         "status": "success",
         "language": request.language,
         "classification": classification,
-        "confidenceScore": confidence,
+        "confidenceScore": round(confidence, 4),
         "explanation": explanation
     }
