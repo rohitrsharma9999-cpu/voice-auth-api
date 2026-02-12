@@ -32,6 +32,17 @@ feature_stats = joblib.load("feature_stats.pkl")
 app = FastAPI(title="AI Voice Authenticity API")
 
 # ==============================
+# HEALTH CHECK ROUTE
+# ==============================
+
+@app.get("/")
+def health_check():
+    return {
+        "status": "success",
+        "message": "AI Voice Authenticity API is running"
+    }
+
+# ==============================
 # REQUEST SCHEMA
 # ==============================
 
