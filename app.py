@@ -3,6 +3,7 @@ import io
 import os
 import joblib
 import numpy as np
+import pandas as pd
 import librosa
 import scipy.stats as stats
 from fastapi import FastAPI, Header, HTTPException
@@ -12,7 +13,7 @@ from pydantic import BaseModel
 # CONFIGURATION
 # ==============================
 
-API_KEY = "sk_hackathon_2026_secure_key"
+API_KEY = os.environ.get("API_KEY")
 
 SUPPORTED_LANGUAGES = ["Tamil", "English", "Hindi", "Malayalam", "Telugu"]
 
@@ -31,11 +32,20 @@ feature_columns = joblib.load("feature_columns.pkl")
 app = FastAPI(title="AI Voice Authenticity API")
 
 # ==============================
+# HEALTH CHECK
+# ==============================
+
+@app.get("/")
+def health_check():
+    return {"status": "API is running"}
+
+# ==============================
 # REQUEST SCHEMA
 # ==============================
 
 class VoiceRequest(BaseModel):
     language: str
+    audioFormat: str
     audioBase64: str
 
 # ==============================
@@ -70,7 +80,7 @@ def extract_features_from_bytes(audio_bytes):
     temporal_smoothness = np.var(np.diff(y))
 
     return {
-        "duration": len(y)/sr,
+        "duration": float(len(y)/sr),
         "mean_energy": float(np.mean(energy)),
         "energy_variance": float(np.var(energy)),
         "zcr_mean": float(np.mean(zcr)),
@@ -94,21 +104,35 @@ def extract_features_from_bytes(audio_bytes):
 @app.post("/api/voice-detection")
 def detect_voice(request: VoiceRequest, x_api_key: str = Header(...)):
 
+    # API Key Validation
+    if API_KEY is None:
+        raise HTTPException(status_code=500, detail="Server API key not configured")
+
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
+    # Language Validation
     if request.language not in SUPPORTED_LANGUAGES:
         raise HTTPException(status_code=400, detail="Unsupported language")
 
+    # Audio Format Validation
+    if request.audioFormat.lower() != "mp3":
+        raise HTTPException(status_code=400, detail="Only MP3 format supported")
+
+    # Base64 Decode
     try:
         audio_bytes = base64.b64decode(request.audioBase64)
-    except:
+    except Exception:
         raise HTTPException(status_code=400, detail="Invalid Base64 audio")
 
+    # Feature Extraction
     features = extract_features_from_bytes(audio_bytes)
 
-    sample_vector = np.array([features[col] for col in feature_columns]).reshape(1, -1)
-    sample_scaled = scaler.transform(sample_vector)
+    # Convert to DataFrame and ensure correct feature order
+    sample_df = pd.DataFrame([features])
+    sample_df = sample_df[feature_columns]
+
+    sample_scaled = scaler.transform(sample_df)
 
     probabilities = model.predict_proba(sample_scaled)[0]
     prediction = model.predict(sample_scaled)[0]
@@ -121,5 +145,5 @@ def detect_voice(request: VoiceRequest, x_api_key: str = Header(...)):
 
     return {
         "classification": classification,
-        "confidence": round(confidence, 2)
+        "confidenceScore": round(confidence, 2)
     }
