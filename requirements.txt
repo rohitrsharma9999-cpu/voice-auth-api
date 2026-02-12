@@ -6,3 +6,5 @@ scipy
 scikit-learn
 joblib
 python-multipart
+pandas
+soundfile
