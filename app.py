@@ -1,10 +1,10 @@
 import base64
+import io
 import os
 import joblib
 import numpy as np
 import librosa
 import scipy.stats as stats
-import tempfile
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
@@ -16,9 +16,6 @@ API_KEY = os.environ.get("API_KEY")
 
 SUPPORTED_LANGUAGES = ["Tamil", "English", "Hindi", "Malayalam", "Telugu"]
 
-MAX_AUDIO_SECONDS = 10          # Duration guard
-MAX_AUDIO_BYTES = 1_000_000     # ~1MB safety guard for free tier
-
 # ==============================
 # LOAD TRAINED MODEL
 # ==============================
@@ -26,7 +23,6 @@ MAX_AUDIO_BYTES = 1_000_000     # ~1MB safety guard for free tier
 model = joblib.load("voice_auth_model.pkl")
 scaler = joblib.load("voice_auth_scaler.pkl")
 feature_columns = joblib.load("feature_columns.pkl")
-feature_stats = joblib.load("feature_stats.pkl")
 
 # ==============================
 # FASTAPI INIT
@@ -40,10 +36,7 @@ app = FastAPI(title="AI Voice Authenticity API")
 
 @app.get("/")
 def health_check():
-    return {
-        "status": "success",
-        "message": "AI Voice Authenticity API is running"
-    }
+    return {"status": "success", "message": "AI Voice Authenticity API is running"}
 
 # ==============================
 # REQUEST SCHEMA
@@ -58,14 +51,16 @@ class VoiceRequest(BaseModel):
 # FEATURE EXTRACTION
 # ==============================
 
-def extract_features(file_path):
-    y, sr = librosa.load(file_path, sr=None)
+def extract_features(audio_bytes):
+    y, sr = librosa.load(io.BytesIO(audio_bytes), sr=None)
 
     duration = len(y) / sr
-    if duration > MAX_AUDIO_SECONDS:
+
+    # Duration Guard (5–15 sec)
+    if duration < 5 or duration > 15:
         raise HTTPException(
             status_code=400,
-            detail=f"Audio too long. Max allowed duration is {MAX_AUDIO_SECONDS} seconds."
+            detail="Audio duration must be between 5 and 15 seconds"
         )
 
     frame_length = 2048
@@ -89,9 +84,11 @@ def extract_features(file_path):
     entropy = stats.entropy(hist + 1e-10)
 
     dynamic_range = np.max(np.abs(y)) - np.min(np.abs(y))
+    energy_modulation = np.var(np.diff(energy))
+    temporal_smoothness = np.var(np.diff(y))
 
-    features = {
-        "duration": duration,
+    return {
+        "duration": float(duration),
         "mean_energy": float(np.mean(energy)),
         "energy_variance": float(np.var(energy)),
         "zcr_mean": float(np.mean(zcr)),
@@ -103,10 +100,10 @@ def extract_features(file_path):
         "spectral_rolloff_mean": float(np.mean(spectral_rolloff)),
         "harmonic_percussive_ratio": float(hpr_ratio),
         "entropy": float(entropy),
-        "dynamic_range": float(dynamic_range)
+        "dynamic_range": float(dynamic_range),
+        "energy_modulation_variance": float(energy_modulation),
+        "temporal_smoothness_index": float(temporal_smoothness),
     }
-
-    return features
 
 # ==============================
 # MAIN ENDPOINT
@@ -115,75 +112,58 @@ def extract_features(file_path):
 @app.post("/api/voice-detection")
 def detect_voice(request: VoiceRequest, x_api_key: str = Header(...)):
 
-    # API KEY VALIDATION
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
-    # LANGUAGE VALIDATION
     if request.language not in SUPPORTED_LANGUAGES:
         raise HTTPException(status_code=400, detail="Unsupported language")
 
-    # FORMAT VALIDATION
-    if request.audioFormat.lower() not in ["mp3", "wav"]:
-        raise HTTPException(status_code=400, detail="Unsupported audio format")
+    if request.audioFormat.lower() != "mp3":
+        raise HTTPException(status_code=400, detail="Only MP3 format supported")
 
-    # BASE64 DECODE
     try:
         audio_bytes = base64.b64decode(request.audioBase64)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid Base64 audio")
+    except:
+        raise HTTPException(status_code=400, detail="Invalid Base64 encoding")
 
-    # SIZE GUARD
-    if len(audio_bytes) > MAX_AUDIO_BYTES:
-        raise HTTPException(
-            status_code=400,
-            detail="Audio file too large. Please upload shorter audio (max 10 seconds)."
-        )
-
-    # SAVE TEMP FILE
-    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{request.audioFormat}") as tmp:
-        tmp.write(audio_bytes)
-        temp_path = tmp.name
+    features = extract_features(audio_bytes)
 
     try:
-        features = extract_features(temp_path)
-
         sample_vector = np.array(
             [features[col] for col in feature_columns]
         ).reshape(1, -1)
-
-        sample_scaled = scaler.transform(sample_vector)
-
-        probabilities = model.predict_proba(sample_scaled)[0]
-        prediction = model.predict(sample_scaled)[0]
-
-        ai_probability = float(probabilities[1])
-        human_probability = float(probabilities[0])
-
-        classification = "AI_GENERATED" if prediction == 1 else "HUMAN"
-        confidence_score = round(max(ai_probability, human_probability), 4)
-
-        # STATISTICALLY ANCHORED EXPLANATION
-        explanation_features = sorted(
-            feature_stats.keys(),
-            key=lambda f: abs(features.get(f, 0) - feature_stats[f]["mean"]),
-            reverse=True
-        )[:3]
-
-        explanation = (
-            f"{classification.replace('_', ' ').title()} classification supported by "
-            f"natural variance in {', '.join(explanation_features)}."
+    except KeyError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Feature mismatch: {str(e)}"
         )
 
-        return {
-            "status": "success",
-            "language": request.language,
-            "classification": classification,
-            "confidenceScore": confidence_score,
-            "explanation": explanation
-        }
+    sample_scaled = scaler.transform(sample_vector)
 
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-            
+    probabilities = model.predict_proba(sample_scaled)[0]
+    prediction = model.predict(sample_scaled)[0]
+
+    ai_prob = float(probabilities[1])
+    human_prob = float(probabilities[0])
+
+    classification = "AI_GENERATED" if prediction == 1 else "HUMAN"
+    confidence = round(max(ai_prob, human_prob), 4)
+
+    explanation_features = sorted(
+        features.items(),
+        key=lambda x: abs(x[1]),
+        reverse=True
+    )[:3]
+
+    explanation = (
+        f"{classification} classification supported by statistical "
+        f"variation in {', '.join([f[0] for f in explanation_features])}."
+    )
+
+    return {
+        "status": "success",
+        "language": request.language,
+        "classification": classification,
+        "confidenceScore": confidence,
+        "explanation": explanation
+    }
