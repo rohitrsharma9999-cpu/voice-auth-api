@@ -1,54 +1,72 @@
 import base64
 import os
-import tempfile
 import joblib
 import numpy as np
 import librosa
 import scipy.stats as stats
+import tempfile
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-# =====================================================
+# ==============================
 # CONFIGURATION
-# =====================================================
+# ==============================
 
 API_KEY = os.environ.get("API_KEY")
 
 SUPPORTED_LANGUAGES = ["Tamil", "English", "Hindi", "Malayalam", "Telugu"]
 
-# =====================================================
-# LOAD TRAINED ARTIFACTS (DSP BACKEND BRAIN)
-# =====================================================
+MAX_AUDIO_SECONDS = 10          # Duration guard
+MAX_AUDIO_BYTES = 1_000_000     # ~1MB safety guard for free tier
+
+# ==============================
+# LOAD TRAINED MODEL
+# ==============================
 
 model = joblib.load("voice_auth_model.pkl")
 scaler = joblib.load("voice_auth_scaler.pkl")
 feature_columns = joblib.load("feature_columns.pkl")
-feature_stats = joblib.load("feature_stats.pkl")  # contains dataset_means & dataset_stds
+feature_stats = joblib.load("feature_stats.pkl")
 
-dataset_means = feature_stats["means"]
-dataset_stds = feature_stats["stds"]
-
-# =====================================================
+# ==============================
 # FASTAPI INIT
-# =====================================================
+# ==============================
 
 app = FastAPI(title="AI Voice Authenticity API")
 
-# =====================================================
+# ==============================
+# HEALTH CHECK
+# ==============================
+
+@app.get("/")
+def health_check():
+    return {
+        "status": "success",
+        "message": "AI Voice Authenticity API is running"
+    }
+
+# ==============================
 # REQUEST SCHEMA
-# =====================================================
+# ==============================
 
 class VoiceRequest(BaseModel):
     language: str
     audioFormat: str
     audioBase64: str
 
-# =====================================================
-# DSP FEATURE EXTRACTION (CONNECTED TO COLAB ENGINE)
-# =====================================================
+# ==============================
+# FEATURE EXTRACTION
+# ==============================
 
-def extract_features_from_file(file_path):
+def extract_features(file_path):
     y, sr = librosa.load(file_path, sr=None)
+
+    duration = len(y) / sr
+    if duration > MAX_AUDIO_SECONDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Audio too long. Max allowed duration is {MAX_AUDIO_SECONDS} seconds."
+        )
 
     frame_length = 2048
     hop_length = 512
@@ -71,11 +89,9 @@ def extract_features_from_file(file_path):
     entropy = stats.entropy(hist + 1e-10)
 
     dynamic_range = np.max(np.abs(y)) - np.min(np.abs(y))
-    energy_modulation = np.var(np.diff(energy))
-    temporal_smoothness = np.var(np.diff(y))
 
-    return {
-        "duration": len(y)/sr,
+    features = {
+        "duration": duration,
         "mean_energy": float(np.mean(energy)),
         "energy_variance": float(np.var(energy)),
         "zcr_mean": float(np.mean(zcr)),
@@ -87,101 +103,87 @@ def extract_features_from_file(file_path):
         "spectral_rolloff_mean": float(np.mean(spectral_rolloff)),
         "harmonic_percussive_ratio": float(hpr_ratio),
         "entropy": float(entropy),
-        "dynamic_range": float(dynamic_range),
-        "energy_modulation_variance": float(energy_modulation),
-        "temporal_smoothness_index": float(temporal_smoothness)
+        "dynamic_range": float(dynamic_range)
     }
 
-# =====================================================
-# STATISTICALLY ANCHORED EXPLANATION ENGINE
-# =====================================================
+    return features
 
-def generate_explanation(features, classification):
-    deviations = {}
-
-    for feature in feature_columns:
-        mean = dataset_means[feature]
-        std = dataset_stds[feature] + 1e-6
-        z_score = abs((features[feature] - mean) / std)
-        deviations[feature] = z_score
-
-    top_features = sorted(deviations, key=deviations.get, reverse=True)[:3]
-
-    if classification == "AI_GENERATED":
-        return f"AI classification influenced by high statistical deviation in {', '.join(top_features)}."
-    else:
-        return f"Human classification supported by natural variance in {', '.join(top_features)}."
-
-# =====================================================
-# HEALTH CHECK
-# =====================================================
-
-@app.get("/")
-def health_check():
-    return {
-        "status": "success",
-        "message": "AI Voice Authenticity API is running"
-    }
-
-# =====================================================
+# ==============================
 # MAIN ENDPOINT
-# =====================================================
+# ==============================
 
 @app.post("/api/voice-detection")
 def detect_voice(request: VoiceRequest, x_api_key: str = Header(...)):
 
-    # API Key Validation
+    # API KEY VALIDATION
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
-    # Language Validation
+    # LANGUAGE VALIDATION
     if request.language not in SUPPORTED_LANGUAGES:
         raise HTTPException(status_code=400, detail="Unsupported language")
 
-    # Format Validation
-    if request.audioFormat.lower() != "mp3":
-        raise HTTPException(status_code=400, detail="Only MP3 format supported")
+    # FORMAT VALIDATION
+    if request.audioFormat.lower() not in ["mp3", "wav"]:
+        raise HTTPException(status_code=400, detail="Unsupported audio format")
 
-    # Base64 Decode
+    # BASE64 DECODE
     try:
         audio_bytes = base64.b64decode(request.audioBase64)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid Base64 audio")
 
-    # Save to temporary file (production-safe MP3 handling)
+    # SIZE GUARD
+    if len(audio_bytes) > MAX_AUDIO_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail="Audio file too large. Please upload shorter audio (max 10 seconds)."
+        )
+
+    # SAVE TEMP FILE
+    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{request.audioFormat}") as tmp:
+        tmp.write(audio_bytes)
+        temp_path = tmp.name
+
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-            tmp.write(audio_bytes)
-            temp_path = tmp.name
+        features = extract_features(temp_path)
 
-        features = extract_features_from_file(temp_path)
+        sample_vector = np.array(
+            [features[col] for col in feature_columns]
+        ).reshape(1, -1)
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Audio processing failed: {str(e)}")
+        sample_scaled = scaler.transform(sample_vector)
+
+        probabilities = model.predict_proba(sample_scaled)[0]
+        prediction = model.predict(sample_scaled)[0]
+
+        ai_probability = float(probabilities[1])
+        human_probability = float(probabilities[0])
+
+        classification = "AI_GENERATED" if prediction == 1 else "HUMAN"
+        confidence_score = round(max(ai_probability, human_probability), 4)
+
+        # STATISTICALLY ANCHORED EXPLANATION
+        explanation_features = sorted(
+            feature_stats.keys(),
+            key=lambda f: abs(features.get(f, 0) - feature_stats[f]["mean"]),
+            reverse=True
+        )[:3]
+
+        explanation = (
+            f"{classification.replace('_', ' ').title()} classification supported by "
+            f"natural variance in {', '.join(explanation_features)}."
+        )
+
+        return {
+            "status": "success",
+            "language": request.language,
+            "classification": classification,
+            "confidenceScore": confidence_score,
+            "explanation": explanation
+        }
 
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
-
-    # Feature vector
-    sample_vector = np.array([features[col] for col in feature_columns]).reshape(1, -1)
-    sample_scaled = scaler.transform(sample_vector)
-
-    probabilities = model.predict_proba(sample_scaled)[0]
-    prediction = model.predict(sample_scaled)[0]
-
-    ai_probability = float(probabilities[1])
-    human_probability = float(probabilities[0])
-
-    classification = "AI_GENERATED" if prediction == 1 else "HUMAN"
-    confidence = float(max(ai_probability, human_probability))
-
-    explanation = generate_explanation(features, classification)
-
-    return {
-        "status": "success",
-        "language": request.language,
-        "classification": classification,
-        "confidenceScore": round(confidence, 4),
-        "explanation": explanation
-    }
+            
