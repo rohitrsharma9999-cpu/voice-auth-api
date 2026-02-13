@@ -23,7 +23,23 @@ model = joblib.load("voice_auth_model.pkl")
 scaler = joblib.load("voice_auth_scaler.pkl")
 feature_columns = joblib.load("feature_columns.pkl")
 
+# ==============================
+# FASTAPI INIT
+# ==============================
+
 app = FastAPI(title="AI Voice Authenticity API")
+
+# ==============================
+# HEALTH CHECK
+# ==============================
+
+@app.get("/")
+def health_check():
+    return {
+        "status": "success",
+        "message": "AI Voice Authenticity API is running"
+    }
+
 
 # ==============================
 # REQUEST SCHEMA
@@ -152,3 +168,4 @@ def detect_voice(request: VoiceRequest, x_api_key: str = Header(...)):
         "confidenceScore": round(confidence, 4),
         "explanation": explanation
     }
+
