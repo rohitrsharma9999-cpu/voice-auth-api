@@ -1,6 +1,6 @@
 import base64
-import io
 import os
+import tempfile
 import joblib
 import numpy as np
 import librosa
@@ -9,34 +9,21 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 # ==============================
-# CONFIGURATION
+# CONFIG
 # ==============================
 
 API_KEY = os.environ.get("API_KEY")
-
 SUPPORTED_LANGUAGES = ["Tamil", "English", "Hindi", "Malayalam", "Telugu"]
 
 # ==============================
-# LOAD TRAINED MODEL
+# LOAD MODEL
 # ==============================
 
 model = joblib.load("voice_auth_model.pkl")
 scaler = joblib.load("voice_auth_scaler.pkl")
 feature_columns = joblib.load("feature_columns.pkl")
 
-# ==============================
-# FASTAPI INIT
-# ==============================
-
 app = FastAPI(title="AI Voice Authenticity API")
-
-# ==============================
-# HEALTH CHECK
-# ==============================
-
-@app.get("/")
-def health_check():
-    return {"status": "success", "message": "AI Voice Authenticity API is running"}
 
 # ==============================
 # REQUEST SCHEMA
@@ -52,11 +39,23 @@ class VoiceRequest(BaseModel):
 # ==============================
 
 def extract_features(audio_bytes):
-    y, sr = librosa.load(io.BytesIO(audio_bytes), sr=None)
+
+    # Save to temp file (CRITICAL FIX)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
+
+    try:
+        y, sr = librosa.load(tmp_path, sr=None)
+    except Exception:
+        os.remove(tmp_path)
+        raise HTTPException(status_code=400, detail="Invalid or corrupted MP3 file")
+
+    os.remove(tmp_path)
 
     duration = len(y) / sr
 
-    # Duration Guard (5–15 sec)
+    # Duration Guard
     if duration < 5 or duration > 15:
         raise HTTPException(
             status_code=400,
@@ -65,7 +64,6 @@ def extract_features(audio_bytes):
 
     frame_length = 2048
     hop_length = 512
-
     frames = librosa.util.frame(y, frame_length=frame_length, hop_length=hop_length)
     energy = np.sum(frames**2, axis=0)
 
@@ -87,8 +85,8 @@ def extract_features(audio_bytes):
     energy_modulation = np.var(np.diff(energy))
     temporal_smoothness = np.var(np.diff(y))
 
-    return {
-        "duration": float(duration),
+    features = {
+        "duration": duration,
         "mean_energy": float(np.mean(energy)),
         "energy_variance": float(np.var(energy)),
         "zcr_mean": float(np.mean(zcr)),
@@ -102,11 +100,13 @@ def extract_features(audio_bytes):
         "entropy": float(entropy),
         "dynamic_range": float(dynamic_range),
         "energy_modulation_variance": float(energy_modulation),
-        "temporal_smoothness_index": float(temporal_smoothness),
+        "temporal_smoothness_index": float(temporal_smoothness)
     }
 
+    return features
+
 # ==============================
-# MAIN ENDPOINT
+# ENDPOINT
 # ==============================
 
 @app.post("/api/voice-detection")
@@ -123,47 +123,32 @@ def detect_voice(request: VoiceRequest, x_api_key: str = Header(...)):
 
     try:
         audio_bytes = base64.b64decode(request.audioBase64)
-    except:
-        raise HTTPException(status_code=400, detail="Invalid Base64 encoding")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid Base64 string")
 
     features = extract_features(audio_bytes)
 
-    try:
-        sample_vector = np.array(
-            [features[col] for col in feature_columns]
-        ).reshape(1, -1)
-    except KeyError as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Feature mismatch: {str(e)}"
-        )
+    sample_vector = np.array(
+        [features[col] for col in feature_columns]
+    ).reshape(1, -1)
 
     sample_scaled = scaler.transform(sample_vector)
 
     probabilities = model.predict_proba(sample_scaled)[0]
     prediction = model.predict(sample_scaled)[0]
 
-    ai_prob = float(probabilities[1])
-    human_prob = float(probabilities[0])
-
+    confidence = float(max(probabilities))
     classification = "AI_GENERATED" if prediction == 1 else "HUMAN"
-    confidence = round(max(ai_prob, human_prob), 4)
-
-    explanation_features = sorted(
-        features.items(),
-        key=lambda x: abs(x[1]),
-        reverse=True
-    )[:3]
 
     explanation = (
         f"{classification} classification supported by statistical "
-        f"variation in {', '.join([f[0] for f in explanation_features])}."
+        f"variance in duration, entropy, and spectral features."
     )
 
     return {
         "status": "success",
         "language": request.language,
         "classification": classification,
-        "confidenceScore": confidence,
+        "confidenceScore": round(confidence, 4),
         "explanation": explanation
     }
