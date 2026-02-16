@@ -164,6 +164,8 @@ def detect_voice(request: VoiceRequest, x_api_key: str = Header(...)):
         f"variance in duration, entropy, and spectral features."
     )
 
+    
+
     return {
         "status": "success",
         "language": request.language,
@@ -172,5 +174,20 @@ def detect_voice(request: VoiceRequest, x_api_key: str = Header(...)):
         "explanation": explanation
     }
 
+from fastapi import UploadFile, File
 
+@app.post("/api/convert-to-base64")
+async def convert_to_base64(file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+        encoded = base64.b64encode(contents).decode("utf-8")
 
+        return {
+            "status": "success",
+            "fileName": file.filename,
+            "base64Length": len(encoded),
+            "audioBase64": encoded
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}"
