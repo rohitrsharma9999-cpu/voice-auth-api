@@ -79,7 +79,7 @@ def extract_features(audio_bytes):
         )
 
     if duration > 15:
-    y = y[: int(15 * sr)]
+        y = y[: int(15 * sr)]
 
     frame_length = 2048
     hop_length = 512
@@ -171,5 +171,6 @@ def detect_voice(request: VoiceRequest, x_api_key: str = Header(...)):
         "confidenceScore": round(confidence, 4),
         "explanation": explanation
     }
+
 
 
