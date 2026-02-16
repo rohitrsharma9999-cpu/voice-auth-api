@@ -40,7 +40,6 @@ def health_check():
         "message": "AI Voice Authenticity API is running"
     }
 
-
 # ==============================
 # REQUEST SCHEMA
 # ==============================
@@ -56,7 +55,7 @@ class VoiceRequest(BaseModel):
 
 def extract_features(audio_bytes):
 
-    # Save to temp file (CRITICAL FIX)
+    # Save audio to temp file
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
         tmp.write(audio_bytes)
         tmp_path = tmp.name
@@ -71,41 +70,47 @@ def extract_features(audio_bytes):
 
     duration = len(y) / sr
 
-    # Duration Guard
+    # Duration Guard (minimum 5 sec, trim beyond 15 sec)
     if duration < 5:
         raise HTTPException(
             status_code=400,
-            detail="Audio duration must be between 5 and 15 seconds"
+            detail="Audio duration must be at least 5 seconds"
         )
 
     if duration > 15:
         y = y[: int(15 * sr)]
+        duration = 15.0
 
+    # Frame energy
     frame_length = 2048
     hop_length = 512
     frames = librosa.util.frame(y, frame_length=frame_length, hop_length=hop_length)
     energy = np.sum(frames**2, axis=0)
 
+    # Core DSP features
     zcr = librosa.feature.zero_crossing_rate(y)[0]
     spectral_centroid = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
     spectral_bandwidth = librosa.feature.spectral_bandwidth(y=y, sr=sr)[0]
     spectral_flatness = librosa.feature.spectral_flatness(y=y)[0]
     spectral_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)[0]
 
+    # Harmonic vs Percussive separation
     y_harmonic, y_percussive = librosa.effects.hpss(y)
     harmonic_energy = np.sum(y_harmonic**2)
     percussive_energy = np.sum(y_percussive**2)
     hpr_ratio = harmonic_energy / (percussive_energy + 1e-6)
 
+    # Entropy
     hist, _ = np.histogram(y, bins=100, density=True)
     entropy = stats.entropy(hist + 1e-10)
 
+    # Advanced temporal features
     dynamic_range = np.max(np.abs(y)) - np.min(np.abs(y))
     energy_modulation = np.var(np.diff(energy))
     temporal_smoothness = np.var(np.diff(y))
 
     features = {
-        "duration": duration,
+        "duration": float(duration),
         "mean_energy": float(np.mean(energy)),
         "energy_variance": float(np.var(energy)),
         "zcr_mean": float(np.mean(zcr)),
@@ -125,34 +130,42 @@ def extract_features(audio_bytes):
     return features
 
 # ==============================
-# ENDPOINT
+# MAIN ENDPOINT
 # ==============================
 
 @app.post("/api/voice-detection")
 def detect_voice(request: VoiceRequest, x_api_key: str = Header(...)):
 
+    # API Key validation
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
+    # Language validation
     if request.language not in SUPPORTED_LANGUAGES:
         raise HTTPException(status_code=400, detail="Unsupported language")
 
+    # Format validation
     if request.audioFormat.lower() != "mp3":
         raise HTTPException(status_code=400, detail="Only MP3 format supported")
 
+    # Base64 decode
     try:
         audio_bytes = base64.b64decode(request.audioBase64)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid Base64 string")
 
+    # Feature extraction
     features = extract_features(audio_bytes)
 
+    # Feature alignment
     sample_vector = np.array(
         [features[col] for col in feature_columns]
     ).reshape(1, -1)
 
+    # Scaling
     sample_scaled = scaler.transform(sample_vector)
 
+    # Prediction
     probabilities = model.predict_proba(sample_scaled)[0]
     prediction = model.predict(sample_scaled)[0]
 
@@ -161,10 +174,8 @@ def detect_voice(request: VoiceRequest, x_api_key: str = Header(...)):
 
     explanation = (
         f"{classification} classification supported by statistical "
-        f"variance in duration, entropy, and spectral features."
+        f"variance in duration, entropy, and spectral characteristics."
     )
-
-    
 
     return {
         "status": "success",
@@ -173,21 +184,3 @@ def detect_voice(request: VoiceRequest, x_api_key: str = Header(...)):
         "confidenceScore": round(confidence, 4),
         "explanation": explanation
     }
-
-from fastapi import UploadFile, File
-
-@app.post("/api/convert-to-base64")
-async def convert_to_base64(file: UploadFile = File(...)):
-    try:
-        contents = await file.read()
-        encoded = base64.b64encode(contents).decode("utf-8")
-
-        return {
-            "status": "success",
-            "fileName": file.filename,
-            "base64Length": len(encoded),
-            "audioBase64": encoded
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}"
