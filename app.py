@@ -72,11 +72,14 @@ def extract_features(audio_bytes):
     duration = len(y) / sr
 
     # Duration Guard
-    if duration < 5 or duration > 15:
+    if duration < 5:
         raise HTTPException(
             status_code=400,
             detail="Audio duration must be between 5 and 15 seconds"
         )
+
+    if duration > 15:
+    y = y[: int(15 * sr)]
 
     frame_length = 2048
     hop_length = 512
@@ -168,4 +171,5 @@ def detect_voice(request: VoiceRequest, x_api_key: str = Header(...)):
         "confidenceScore": round(confidence, 4),
         "explanation": explanation
     }
+
 
